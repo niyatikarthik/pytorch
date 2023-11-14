@@ -4,14 +4,38 @@
 #include <ATen/ATen.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/native/vulkan/api/api.h>
+#include <ATen/native/vulkan/api/Utils.h>
 #include <ATen/native/vulkan/ops/Copy.h>
 #include <ATen/native/vulkan/ops/Convolution.h>
+#include <ATen/native/vulkan/ops/Utils.h>
 #include <c10/util/irange.h>
 #include <c10/util/ArrayRef.h>
+#include <iostream>
+#include <math.h>
 
 // TODO: These functions should move to a common place.
 
 namespace {
+
+using namespace at::native::vulkan;
+using at::native::vulkan::api::utils::vec4;
+using at::native::vulkan::api::utils::ivec3;
+using at::native::vulkan::api::utils::ivec4;
+
+std::ostream& operator<<(std::ostream& os, const vec4& v) {
+  os << "(" << v.data[0u] << ", " << v.data[1u] << ", " << v.data[2u] << ", " << v.data[3u] << ")";
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const ivec3& v) {
+  os << "(" << v.data[0u] << ", " << v.data[1u] << ", " << v.data[2u] << ")";
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const ivec4& v) {
+  os << "(" << v.data[0u] << ", " << v.data[1u] << ", " << v.data[2u] << ")";
+  return os;
+}
 
 #ifdef USE_VULKAN_FP16_INFERENCE
   constexpr float kTolerance = 1e-2;
@@ -3298,6 +3322,24 @@ TEST_F(VulkanAPITest, mm) {
   ASSERT_TRUE(check);
 }
 
+TEST_F(VulkanAPITest, DISABLED_mm_m2_vulkan) {
+  const auto m1_cpu = at::rand({179, 67}, at::device(at::kCPU).dtype(at::kFloat));
+  const auto m2_cpu = at::rand({67, 163}, at::device(at::kCPU).dtype(at::kFloat));
+  const auto out_cpu = m1_cpu.mm(m2_cpu);
+
+  const auto m1_vulkan = m1_cpu.vulkan();
+  // When m2 is a vulkan, the current implementation forgot
+  // to pre-pack the m2 tensor, yielding wrong results.
+  const auto out_vulkan = m1_vulkan.mm(m2_cpu.vulkan());
+
+  const auto check = almostEqual(out_cpu, out_vulkan.cpu());
+  if (!check) {
+    showRtol(out_cpu, out_vulkan.cpu());
+  }
+
+  ASSERT_TRUE(check);
+}
+
 TEST_F(VulkanAPITest, mm_error) {
   // mismatched dimensions of m1 and m2.
   const auto m1_cpu = at::rand({179, 99}, at::device(at::kCPU).dtype(at::kFloat));
@@ -4765,7 +4807,7 @@ TEST_F(VulkanAPITest, normal_) {
 
 TEST_F(VulkanAPITest, normal_large) {
   float a_mean = 1.0;
-  float a_std = 0.001;
+  float a_std = 0.01;
 
   auto a_vulkan =
       at::zeros({30, 40, 50, 60}, at::device(at::kCPU).dtype(at::kFloat)).vulkan();
@@ -7789,6 +7831,73 @@ TEST_F(VulkanAPITest, lstm_prepack_success) {
     showRtol(cpu_cell, vulkan_cell.cpu());
   }
   ASSERT_TRUE(check_cell);
+}
+
+bool texel_almost_equal(int expected, float actual) {
+  // -1 is a don't care value.
+  return (expected == -1) || (fabs(expected - actual) < kTolerance);
+}
+
+bool texel_almost_equal(const ivec4& expected, const vec4& actual) {
+  return (
+      texel_almost_equal(expected.data[0], actual.data[0]) &&
+      texel_almost_equal(expected.data[1], actual.data[1]) &&
+      texel_almost_equal(expected.data[2], actual.data[2]) &&
+      texel_almost_equal(expected.data[3], actual.data[3]));
+}
+
+TEST_F(VulkanAPITest, debug_only_get_texel_test) {
+  int n = 3;
+  int c = 5;
+  int h = 6;
+  int w = 7;
+  int hw = h * w;
+  int chw = c * h * w;
+
+  // The input tensor is a consecutive range of whole numbers from [0, n * c * h
+  // * w)
+  auto cpu =
+      at::range(0, n * c * h * w - 1, at::device(at::kCPU).dtype(at::kFloat))
+          .reshape({n, c, h, w});
+  auto vk = cpu.vulkan();
+
+  // By default, we are using channel-packed 3d tensors.
+  // The x and y are typical plane.
+  // The z channel is packed with batch and channel, e.g. every 4 channels are
+  // packed into one texel. Hence, to access a tensor at batch nn and channel
+  // cc, we will calculate the z coordinate = nn * ceil(c / 4) + cc / 4, where c
+  // is the channel count.
+  // We always start a new batch on a new z. Hence, when c cannot be divided by
+  // 4, there are some undefined values in the padding area. We use -1 to
+  // indicate that we are not performing comparsion on those values.
+  std::tuple<ivec3, ivec4> test_cases[]{
+      {{0, 0, 0}, {0, hw, 2 * hw, 3 * hw}},
+      {{1, 0, 0}, {1, hw + 1, 2 * hw + 1, 3 * hw + 1}},
+      {{0, 0, 1}, {4 * hw, -1, -1, -1}},
+      {{0, 0, 2}, {chw, chw + hw, chw + 2 * hw, chw + 3 * hw}},
+      {{0, 1, 2}, {chw + w, chw + hw + w, chw + 2 * hw + w, chw + 3 * hw + w}},
+      {{0, 0, 3}, {chw + 4 * hw, -1, -1, -1}},
+      {{0, 1, 3}, {chw + 4 * hw + w, -1, -1, -1}},
+      {{0, 0, 4}, {2 * chw, 2 * chw + hw, 2 * chw + 2 * hw, 2 * chw + 3 * hw}},
+      {{0, 1, 4},
+       {2 * chw + w,
+        2 * chw + hw + w,
+        2 * chw + 2 * hw + w,
+        2 * chw + 3 * hw + w}},
+  };
+
+  bool has_failure = false;
+  for (const auto& test_case : test_cases) {
+    const auto [loc, expected] = test_case;
+
+    vec4 actual = ops::utils::debug_only_get_texel(vk, loc);
+    if (!texel_almost_equal(expected, actual)) {
+      std::cout << "On loc: " << loc << " expected: " << expected
+                << " actual: " << actual << std::endl;
+      has_failure = true;
+    }
+  }
+  ASSERT_FALSE(has_failure);
 }
 
 TEST_F(VulkanAPITest, querypool_flushed_shader_log) {
