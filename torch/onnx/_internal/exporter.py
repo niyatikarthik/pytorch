@@ -29,6 +29,8 @@ from typing import (
     Union,
 )
 
+import numpy
+
 from typing_extensions import Self
 
 import torch
@@ -632,6 +634,34 @@ class ONNXProgram:
         self._diagnostic_context = diagnostic_context
         self._fake_context = fake_context
         self._export_exception = export_exception
+
+    def __call__(
+        self, *args: Any, options=None, **kwargs: Any
+    ) -> Sequence[Union[numpy.ndarray, torch.Tensor, int, float, bool]]:
+        """Runs the ONNX model using ONNX Runtime
+
+        Args:
+            args: The positional inputs to the model.
+            kwargs: The keyword inputs to the model.
+            options: The options to use for running the model with ONNX Runtime.
+
+        Returns:
+            The model output as computed by ONNX Runtime
+        """
+        import onnxruntime  # type: ignore[import]
+
+        onnx_input = self.adapt_torch_inputs_to_onnx(*args, **kwargs)
+        options = options or {}
+        providers = options.get("providers", onnxruntime.get_available_providers())
+        onnx_model = self.model_proto.SerializeToString()
+        ort_session = onnxruntime.InferenceSession(onnx_model, providers=providers)
+
+        onnxruntime_input = {
+            k.name: torch.Tensor.numpy(v, force=True)
+            for k, v in zip(ort_session.get_inputs(), onnx_input)
+        }
+
+        return ort_session.run(None, onnxruntime_input)
 
     @property
     def model_proto(self) -> onnx.ModelProto:  # type: ignore[name-defined]
